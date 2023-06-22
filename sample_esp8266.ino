@@ -41,10 +41,16 @@ String  OnButt;
 String  OffButt;
 String  SendButt;
 
+volatile bool    RelayState      = false;   // Relay off
+bool    LEDState        = true;    // Green LED off
+bool    ButtonFlag      = false;   // Does the button need to be handled on this loop
+int ButtonCount    = 0;       // How many cycles/checks the button has been pressed for.
+String  OnButt;
+String  OffButt;
+
 //Setup classes needed from libraries.
 MDNSResponder mdns;
 Ticker buttonTick;
-Ticker tickerConnect;
 ESP8266WebServer server(SERVERPORT);
 ESP8266HTTPUpdateServer httpUpdater;
 //mqttclient
@@ -55,18 +61,11 @@ long lastMsg = 0;
 char msg[50];
 int value = 0;
 
-SimpleTimer timerCnt;
-volatile bool blinkOn;
-volatile unsigned long nextMil;
-
 void setup(void){  
   //  Init
   pinMode(BUTTONPIN, INPUT);
   pinMode(LEDPIN, OUTPUT);
   pinMode(RELAYPIN, OUTPUT);
-  pinMode(CLICKPIN, INPUT_PULLUP);
-
-  attachInterrupt(BUTTONPIN, getButton, FALLING);
   
   Serial.begin(115200); 
   delay(5000);
@@ -88,6 +87,9 @@ void setup(void){
     digitalWrite(LEDPIN, HIGH);
     delay(500);
   }
+
+  attachInterrupt(digitalPinToInterrupt(BUTTONPIN), Test_Interrupt, RISING);
+
   setLED(false);
   //Print startup status and network information
   Serial.println("");
@@ -119,7 +121,6 @@ void setup(void){
 
   client.setServer(mqtt_server,mqtt_port);
   client.setCallback(callback);
-  reconnect();
 
  
   //Start up blink of LED signaling everything is ready. Fast Flash
@@ -128,14 +129,15 @@ void setup(void){
     delay(100);
   }
   Serial.println("Server is up.");
+  Serial.println(digitalRead(BUTTONPIN));
 
   //Enable periodic watcher for button event handling
   buttonTick.attach(BUTTONTIME, buttonFlagSet);
 }
+
 //mqtt
 void mqtt_publish(char* message,const char* sender){
   if(!client.connected()){
-    Serial.println("Mqtt reconnect");
     reconnect();
   }
   client.loop();
@@ -150,13 +152,12 @@ void mqtt_publish(char* message,const char* sender){
   serializeJson(doc, output);
 
   client.publish(mqtt_topic, output);  
-  Serial.println("Mqtt Send");
+ 
   delay(100);
 }
 void callback(char* topic, byte* payload, unsigned int length) {
   String Msg = "";
   int i=0;
-  Serial.println("Mqtt Message Arrived here");
   while (i<length) Msg += (char)payload[i++];
   
   StaticJsonDocument<256> doc;
@@ -210,13 +211,8 @@ void callback(char* topic, byte* payload, unsigned int length) {
   }
 } 
 void reconnect() {
-  if(client.connected()){
-    Serial.println("Already connected on mqtt server");
-    client.publish(mqtt_topic_con, "test button is already conneted on mqtt server");
-  }
-  else{
-    // Loop until we're reconnected
-    Serial.println("Attempting MQTT connection...");
+  // Loop until we're reconnected
+    Serial.print("Attempting MQTT connection...");
     // Attempt to connect
     if (client.connect(mqtt_id)) { //change to ClientID
       Serial.println("connected");
@@ -225,13 +221,16 @@ void reconnect() {
       client.subscribe(mqtt_topic_sub);
  
       // Once connected, publish an announcement...
-      client.publish(mqtt_topic_con, "{\"sender\":\"self\",\"message\":\"reconneted\",\"room\":\"test\"}");
+      client.publish(mqtt_topic_con, "{\"sender\":\"self\",\"message\":\"reconneted\",\"room\":\"test room\"}");
        
     } else {
       Serial.print("failed, rc=");
       Serial.println(client.state());
+      // Serial.println(" try again in 5 seconds");
+      // Wait 5 seconds before retrying
+      // delay(5000);
     }
-  }
+ 
 }
 /*
  * printMAC
@@ -298,7 +297,6 @@ void handleGET() {
   buff += "<input type=\"hidden\" name=\"return\" value=\"TRUE\">";
   buff += "<input type=\"submit\" name=\"state\" class=\"submit\" value=\"ON\" style=\"" + OnButt + "\">\n";
   buff += "<input type=\"submit\" name=\"state\" class=\"submit\" value=\"OFF\" style=\"" + OffButt + "\">\n";
-  buff += "<input type=\"submit\" name=\"state\" class=\"submit\" value=\"SEND\" style=\"" + SendButt + "\">\n";
   buff += "</form></body></html>\n";
   server.send(200, "text/html", buff);
 
@@ -310,10 +308,8 @@ void RelayStateGET(){
     String  buff;
   if (RelayState) {
     buff = "ON\n";
-    mqtt_publish("test On message","test");
   } else {
     buff = "OFF\n";
-    mqtt_publish("test Off message","test");
   }
   server.send(50, "text/html", buff);
 }
@@ -349,10 +345,8 @@ void handleStateGET() {
   String  buff;
   if (RelayState) {
     buff = "ON\n";
-    mqtt_publish("test On message","test");
   } else {
     buff = "OFF\n";
-    mqtt_publish("test Off message","test");
   }
 
   server.send(200, "text/html", buff);
@@ -403,19 +397,24 @@ void buttonFlagSet(void) {
   ButtonFlag = true;
 }
 
+ICACHE_RAM_ATTR void Test_Interrupt() {
+  Serial.println("Test Interrupt!!!");
+  setRelay(!RelayState); // change relay
+}
+
 /* Read and handle button Press*/
-ICACHE_RAM_ATTR void getButton(void) {
+void getButton(void) {
   // short press butoon to change state of relay
   if (digitalRead(BUTTONPIN) == false ) {
     ++ButtonCount;
     }
   if (digitalRead(BUTTONPIN) == false && ButtonCount > 1 && ButtonCount < 12 ) {
-    setRelay(!RelayState); // change relay
-      if(RelayState==true){
-        client.publish(mqtt_topic,"{\"sender\":\"self\",\"message\":\"On\",\"room\":\"test\"}"); 
+    Serial.println(RelayState);
+      if(RelayState==false){
+        client.publish(mqtt_topic,"{\"sender\":\"self\",\"message\":\"On\",\"room\":\"test room\"}"); 
       }
       else{
-        client.publish(mqtt_topic,"{\"sender\":\"self\",\"message\":\"Off\",\"room\":\"test\"}");
+        client.publish(mqtt_topic,"{\"sender\":\"self\",\"message\":\"Off\",\"room\":\"test room\"}");
       }
       ButtonCount = 0;
       delay(500);
@@ -439,6 +438,15 @@ ICACHE_RAM_ATTR void getButton(void) {
  */
 void loop(void){
   server.handleClient();           // Listen for HTTP request
-  if(!client.connected()) reconnect();
+  // if (ButtonFlag) getButton();// Handle the button press 
+  if(!client.connected()){
+    reconnect();
+  }
+  else {
+    if(ButtonFlag) {
+      getButton();
+    }
+  }
   client.loop();
 } 
+
