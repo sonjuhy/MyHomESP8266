@@ -5,8 +5,8 @@
 #include <ESP8266mDNS.h>
 #include <ESP8266HTTPUpdateServer.h>
 #include <PubSubClient.h>
-#include <SimpleTimer.h>
 #include <ArduinoJson.h>
+#include <AsyncMqtt_Generic.h>
 
 #define APSSID          "WIFI NAME"   //AP SSID
 #define APPASSWORD      "WIFI PASSWORD"         //AP password
@@ -25,71 +25,88 @@
 #define BUTTONOFF       "color: red; border: 3px #fff outset;"
 #define BUTTONNOACT     "color: black; border: 7px #fff outset;"
 #define BUTTONDEBOUNCE  1 //Minimum number of seconds between a valid button press or relay switch.
-#define mqtt_server     "192.168.0.1"
-#define mqtt_port       1883
 #define mqtt_id         "test"
 #define mqtt_topic      "MyHome/Light/test"
 #define mqtt_topic_sta  "MyHome/Light/Sub/Server/State"
 #define mqtt_topic_con  "MyHome/Light/Sub/Server/Connect"
 #define mqtt_topic_sub  "MyHome/Light/Pub/test"
+#define MQTT_HOST IPAddress(192,168,0,1)
+#define MQTT_PORT 1883
 
-bool    LEDState        = true;    // Green LED off
-bool    RelayState      = false;   // Relay off
-bool    ButtonFlag      = false;   // Does the button need to be handled on this loop
-char    ButtonCount     = 0;       // How many cycles/checks the button has been pressed for.
-String  OnButt;
-String  OffButt;
-String  SendButt;
+long buttonPressTime = 0;
+bool buttonPressed = false;
+bool LongRelayMode = false;  // press long time for woring relay
 
-volatile bool    RelayState      = false;   // Relay off
-bool    LEDState        = true;    // Green LED off
-bool    ButtonFlag      = false;   // Does the button need to be handled on this loop
-int ButtonCount    = 0;       // How many cycles/checks the button has been pressed for.
-String  OnButt;
-String  OffButt;
+volatile bool RelayState = false;     // Relay off
+bool LEDState = true;                 // Green LED off
+bool ButtonFlag = false;              // Does the button need to be handled on this loop
+bool wifiCon = false;
+int ButtonCount = 0;                  // How many cycles/checks the button has been pressed for.
+String OnButt;
+String OffButt;
+
+// MQTT with async-mqtt-lib
+AsyncMqttClient asyncMQTTClient;
+Ticker mqttReconnectTimer;
+
+WiFiEventHandler wifiConnectHandler;
+WiFiEventHandler wifiDisconnectHandler;
+Ticker wifiReconnectTimer;
 
 //Setup classes needed from libraries.
 MDNSResponder mdns;
 Ticker buttonTick;
 ESP8266WebServer server(SERVERPORT);
 ESP8266HTTPUpdateServer httpUpdater;
-//mqttclient
-WiFiClient espClient;
-PubSubClient client(espClient);
 
 long lastMsg = 0;
 char msg[50];
 int value = 0;
 
-void setup(void){  
+void setup(void) {
   //  Init
   pinMode(BUTTONPIN, INPUT);
   pinMode(LEDPIN, OUTPUT);
   pinMode(RELAYPIN, OUTPUT);
-  
-  Serial.begin(115200); 
+
+  Serial.begin(115200);
   delay(5000);
+
 
   //Start wifi connection
   Serial.println("Connecting to wifi..");
+
+  wifiConnectHandler = WiFi.onStationModeGotIP(onWifiConnect);
+  wifiDisconnectHandler = WiFi.onStationModeDisconnected(onWifiDisconnect);
+
+  asyncMQTTClient.onConnect(onMqttConnect);
+  asyncMQTTClient.onDisconnect(onMqttDisconnect);
+  asyncMQTTClient.onSubscribe(onMqttSubscribe);
+  asyncMQTTClient.onUnsubscribe(onMqttUnsubscribe);
+  asyncMQTTClient.onMessage(onMqttMessage);
+  asyncMQTTClient.onPublish(onMqttPublish);
+  asyncMQTTClient.setServer(MQTT_HOST, MQTT_PORT);
+
+  connectToWifi();
+
+  //Enable periodic watcher for button event handling
+  buttonTick.attach(BUTTONTIME, buttonFlagSet);
+}
+
+// MQTT with async-mqtt-lib
+void connectToWifi() {
+  Serial.println("Connecting to Wi-Fi...");
   WiFi.begin(APSSID, APPASSWORD);
-  
-  //Print MAC to serial so we can use the address for auth if needed.
-  printMAC();
+}
 
-  // Wait for connection - Slow flash
-  Serial.print("Waiting on Connection ...");
-  while (WiFi.status() != WL_CONNECTED) {
-    digitalWrite(LEDPIN, LOW);
-    delay(500);
-    Serial.print(".");
-    //Serial.println(WiFi.status());
-    digitalWrite(LEDPIN, HIGH);
-    delay(500);
-  }
+void connectToMqtt() {
+  Serial.println("Connecting to MQTT...");
+  asyncMQTTClient.connect();
+}
 
-  attachInterrupt(digitalPinToInterrupt(BUTTONPIN), Test_Interrupt, RISING);
-
+void onWifiConnect(const WiFiEventStationModeGotIP& event) {
+  Serial.println("Connected to Wi-Fi.");
+  wifiCon = true;
   setLED(false);
   //Print startup status and network information
   Serial.println("");
@@ -99,7 +116,7 @@ void setup(void){
   Serial.println(WiFi.localIP());
   Serial.print("Gateway: ");
   Serial.println(WiFi.gatewayIP());
-  Serial.print("Subnet: ");  
+  Serial.print("Subnet: ");
   Serial.println(WiFi.subnetMask());
   Serial.print("Device ID: ");
   Serial.println(ESP.getChipId());
@@ -111,37 +128,126 @@ void setup(void){
   server.on("/", HTTP_GET, handleGET);
   server.on("/device", HTTP_POST, handleStatePOST);
   server.on("/device", HTTP_GET, handleStateGET);
-  server.on("/state",HTTP_GET,RelayStateGET);
-  server.on("/change",HTTP_GET,RelayChange);
+  server.on("/state", HTTP_GET, RelayStateGET);
+  server.on("/change", HTTP_GET, RelayChange);
   server.onNotFound(handleNotFound);
-  httpUpdater.setup(&server, OTAPATH, OTAUSER, OTAPASSWORD); //OTA Update endpoint
-  
+  httpUpdater.setup(&server, OTAPATH, OTAUSER, OTAPASSWORD);  //OTA Update endpoint
+
   //Start the web server
   server.begin();
 
-  client.setServer(mqtt_server,mqtt_port);
-  client.setCallback(callback);
-
- 
   //Start up blink of LED signaling everything is ready. Fast Flash
   for (int i = 0; i < 10; i++) {
     setLED(!LEDState);
     delay(100);
   }
   Serial.println("Server is up.");
-  Serial.println(digitalRead(BUTTONPIN));
-
-  //Enable periodic watcher for button event handling
-  buttonTick.attach(BUTTONTIME, buttonFlagSet);
+  connectToMqtt();
 }
 
-//mqtt
-void mqtt_publish(char* message,const char* sender){
-  if(!client.connected()){
-    reconnect();
+void onWifiDisconnect(const WiFiEventStationModeDisconnected& event) {
+  Serial.println("Disconnected from Wi-Fi.");
+  mqttReconnectTimer.detach(); // ensure we don't reconnect to MQTT while reconnecting to Wi-Fi
+  wifiReconnectTimer.once(2, connectToWifi);
+}
+
+void onMqttConnect(bool sessionPresent) {
+  Serial.println("Connected to MQTT.");
+  Serial.print("Session present: ");
+  Serial.println(sessionPresent);
+
+  uint16_t packetIdSub = asyncMQTTClient.subscribe(mqtt_topic_sub, 2);
+  Serial.print("Subscribing at QoS 2, packetId: ");
+  Serial.println(packetIdSub);
+}
+
+void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
+  Serial.println("Disconnected from MQTT.");
+
+  if (WiFi.isConnected()) {
+    mqttReconnectTimer.once(2, connectToMqtt);
   }
-  client.loop();
-  
+}
+
+void onMqttSubscribe(uint16_t packetId, uint8_t qos) {
+  Serial.println("Subscribe acknowledged.");
+  Serial.print("  packetId: ");
+  Serial.println(packetId);
+  Serial.print("  qos: ");
+  Serial.println(qos);
+}
+
+void onMqttUnsubscribe(uint16_t packetId) {
+  Serial.println("Unsubscribe acknowledged.");
+  Serial.print("  packetId: ");
+  Serial.println(packetId);
+}
+
+void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total) {
+  String Msg = "";
+  int i = 0;
+  while (i < len) Msg += (char)payload[i++];
+
+  StaticJsonDocument<256> doc;
+  DeserializationError error = deserializeJson(doc, Msg.c_str(), len);
+
+  if (error) {
+    Serial.print(F("deserializeJson() failed: "));
+    Serial.println(error.c_str());
+    char error_put[64];
+    StaticJsonDocument<64> doc;
+    doc["sender"] = "self";
+    doc["message"] = error.c_str();
+    doc["room"] = mqtt_id;
+    mqttPublish(error.c_str(), "self");
+    return;
+  }
+
+  const char* sender = doc["Light"]["sender"];
+  const char* message = doc["Light"]["message"];
+  const char* destination = doc["Light"]["destination"];
+
+  const char* char_message_on = "On";
+  const char* char_message_off = "Off";
+  const char* char_message_already_on = "already On";
+  const char* char_message_already_off = "already Off";
+
+  String message_str = message;
+  String destination_str = destination;
+
+  if (message_str.equals("ON")) {
+    if (RelayState == true) {
+      mqttPublish(char_message_already_on, sender);
+    } else {
+      setRelay(!RelayState);
+      mqttPublish(char_message_on, sender);
+    }
+  } else if (message_str.equals("STATE")) {
+    if (RelayState == true) {
+      mqttPublish(char_message_on, sender);
+    } else {
+      mqttPublish(char_message_off, sender);
+    }
+  } else if (message_str.equals("OFF")){
+    if (RelayState == true) {
+      setRelay(!RelayState);
+      mqttPublish(char_message_off, sender);
+    } else {
+      mqttPublish(char_message_already_off, sender);
+    }
+  }
+  else if(message_str.equals("MODE")){
+    setMode(!LongRelayMode);
+  }
+}
+
+void onMqttPublish(uint16_t packetId) {
+  Serial.println("Publish acknowledged.");
+  Serial.print("  packetId: ");
+  Serial.println(packetId);
+}
+
+void mqttPublish(const char* message,const char* sender ){
   char output[256];
   StaticJsonDocument<256> doc;
 
@@ -151,128 +257,18 @@ void mqtt_publish(char* message,const char* sender){
 
   serializeJson(doc, output);
 
-  client.publish(mqtt_topic, output);  
- 
+  asyncMQTTClient.publish(mqtt_topic, 1, true, output);
+
   delay(100);
 }
-void callback(char* topic, byte* payload, unsigned int length) {
-  String Msg = "";
-  int i=0;
-  while (i<length) Msg += (char)payload[i++];
-  
-  StaticJsonDocument<256> doc;
-  DeserializationError error = deserializeJson(doc, Msg.c_str(), length);
-  
-  if (error) {
-    Serial.print(F("deserializeJson() failed: "));
-    Serial.println(error.c_str());
-    char error_put[64];
-    StaticJsonDocument<64> doc;
-    doc["sender"] = "self";
-    doc["message"] = error.c_str();
-    doc["room"] = mqtt_id;
-    client.publish(mqtt_topic, error_put);
-    return;
-  }
 
-  const char* sender = doc["Light"]["sender"];
-  const char* message = doc["Light"]["message"];
-  const char* destination = doc["Light"]["destination"];
-  String message_str = message;
-  String destination_str = destination;
-  
-  if(message_str.equals("ON")){
-    if(RelayState == true){
-      mqtt_publish("already On", sender);
-    }
-    else{
-      setRelay(!RelayState);
-      mqtt_publish("On", sender);
-    }
-  }
-  else if(message_str.equals("STATE")){
-    if(RelayState == true){
-      mqtt_publish("On", sender);
-    }
-    else{
-      mqtt_publish("Off", sender);
-    }
-  }
-  else{
-    if(message_str.equals("OFF")){
-      if(RelayState == true){
-        setRelay(!RelayState);
-        mqtt_publish("Off", sender);
-      }
-      else{
-        mqtt_publish("already Off", sender);
-      }
-    }
-  }
-} 
-void reconnect() {
-  // Loop until we're reconnected
-    Serial.print("Attempting MQTT connection...");
-    // Attempt to connect
-    if (client.connect(mqtt_id)) { //change to ClientID
-      Serial.println("connected");
-       
-      // ... and resubscribe
-      client.subscribe(mqtt_topic_sub);
- 
-      // Once connected, publish an announcement...
-      client.publish(mqtt_topic_con, "{\"sender\":\"self\",\"message\":\"reconneted\",\"room\":\"test room\"}");
-       
-    } else {
-      Serial.print("failed, rc=");
-      Serial.println(client.state());
-      // Serial.println(" try again in 5 seconds");
-      // Wait 5 seconds before retrying
-      // delay(5000);
-    }
- 
-}
-/*
- * printMAC
- * Print the device MAC address to the serial port.
- */
-void printMAC(void) {
-  byte mac[6];
-  WiFi.macAddress(mac);
-  Serial.print("MAC: ");
-  Serial.print(mac[0],HEX);
-  Serial.print(":");
-  Serial.print(mac[1],HEX);
-  Serial.print(":");
-  Serial.print(mac[2],HEX);
-  Serial.print(":");
-  Serial.print(mac[3],HEX);
-  Serial.print(":");
-  Serial.print(mac[4],HEX);
-  Serial.print(":");
-  Serial.println(mac[5],HEX);
-}
-
-/* 
- *  handleNotFound
- *  Return a 404 error on not found page.
- */
 void handleNotFound() {
   server.send(404, "text/plain", "404: Not found");
 }
-
-/* 
- *  handleMainPage - GET
- *  Return Text for main page on GET
- */
 void handleGET() {
-  //Quick LED Flash
-  //setLED(!LEDState);
-
-  //Serve Page
   Serial.println("Serviced Page Request");
-  String  buff;
-  buff  = "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\">\n";
+  String buff;
+  buff = "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\">\n";
   buff += "<html><head>\n";
   buff += "<style type=\"text/css\">\n";
   buff += "html {font-family: sans-serif;background:#f0f5f5}\n";
@@ -300,12 +296,10 @@ void handleGET() {
   buff += "</form></body></html>\n";
   server.send(200, "text/html", buff);
 
-  //Quick LED Flash
   delay(20);
-  //setLED(!LEDState);
 }
-void RelayStateGET(){
-    String  buff;
+void RelayStateGET() {
+  String buff;
   if (RelayState) {
     buff = "ON\n";
   } else {
@@ -313,14 +307,10 @@ void RelayStateGET(){
   }
   server.send(50, "text/html", buff);
 }
-void RelayChange(){
+void RelayChange() {
   setRelay(!RelayState);
   RelayStateGET();
 }
-/* 
- *  handleStatePOST
- *  Modify state on POST
- */
 void handleStatePOST() {
   /* request for www user/password from client */
   if (!server.authenticate(WWWUSERNAME, WWWPASSWORD))
@@ -332,17 +322,12 @@ void handleStatePOST() {
   if (server.arg("return") == "TRUE") handleGET();
   else handleStateGET();
 }
-
-/* 
- *  handleStateGET
- *  Print state on GET
- */
-void handleStateGET() {    
+void handleStateGET() {
   //Serve Page
   Serial.println("Serviced API Request");
 
   //Print Relay state
-  String  buff;
+  String buff;
   if (RelayState) {
     buff = "ON\n";
   } else {
@@ -350,103 +335,85 @@ void handleStateGET() {
   }
 
   server.send(200, "text/html", buff);
-  
+
   //Quick LED Flash
   delay(20);
   //setLED(!LEDState);
 }
-
-/* 
- *  setRelay
- *  Sets the state of the Relay
-*/
 void setRelay(bool SetRelayState) {
   //Switch the HTML for the display page
   if (SetRelayState == true) {
-    OnButt  = BUTTONON;
+    OnButt = BUTTONON;
     OffButt = BUTTONNOACT;
   }
   if (SetRelayState == false) {
     OnButt = BUTTONNOACT;
-    OffButt  = BUTTONOFF;
+    OffButt = BUTTONOFF;
   }
 
   //Set the relay state
   RelayState = SetRelayState;
-  
+
   digitalWrite(RELAYPIN, RelayState);
 
   //Set the LED to opposite of the button.
   //setLED(!SetRelayState);
 }
-
-/*
- * setLED
- * Sets the state of the LED
- */
 void setLED(bool SetLEDState) {
-  LEDState = SetLEDState;     // set green LED
+  LEDState = SetLEDState;  // set green LED
   digitalWrite(LEDPIN, LEDState);
 }
+void setMode(bool SetModeState){
+  LongRelayMode = SetModeState;
+}
 
-/*
- * ButtonFlagSet
- * Sets a variable so that on next loop, the button state is handled.
- */
 void buttonFlagSet(void) {
   ButtonFlag = true;
 }
 
-ICACHE_RAM_ATTR void Test_Interrupt() {
-  Serial.println("Test Interrupt!!!");
-  setRelay(!RelayState); // change relay
-}
-
-/* Read and handle button Press*/
-void getButton(void) {
-  // short press butoon to change state of relay
-  if (digitalRead(BUTTONPIN) == false ) {
-    ++ButtonCount;
+void controlButton(void){
+  if(LongRelayMode){
+    if(digitalRead(BUTTONPIN) == false){
+      if(buttonPressTime == 0){
+        buttonPressTime = millis();
+      }
+      else if(millis() - buttonPressTime >= 2000){
+        Serial.println("LongPress is working");
+        if (RelayState == false) {
+          mqttPublish("On","self");
+        } else {
+          mqttPublish("Off","self");   
+        }
+        setRelay(!RelayState);
+        buttonPressTime = 0;
+      }
     }
-  if (digitalRead(BUTTONPIN) == false && ButtonCount > 1 && ButtonCount < 12 ) {
-    Serial.println(RelayState);
-      if(RelayState==false){
-        client.publish(mqtt_topic,"{\"sender\":\"self\",\"message\":\"On\",\"room\":\"test room\"}"); 
+    else{
+      buttonPressTime = 0;
+    }
+  }
+  else{
+    if (digitalRead(BUTTONPIN) == false) {
+      Serial.println(RelayState);
+      if (RelayState == false) {
+        mqttPublish("On","self");
+      } else {
+        mqttPublish("Off","self");   
       }
-      else{
-        client.publish(mqtt_topic,"{\"sender\":\"self\",\"message\":\"Off\",\"room\":\"test room\"}");
-      }
-      ButtonCount = 0;
+      setRelay(!RelayState);
       delay(500);
+    }
   }
-  /* long press button restart */
-  if (ButtonCount > 12) {
-    setLED(!LEDState);
-    buttonTick.detach();    // Stop Tickers
-    /* Wait for release button */
-    while (!digitalRead(BUTTONPIN)) yield();
-    delay(100);
-    ESP.restart();
-  }
-  if (digitalRead(BUTTONPIN) == true) ButtonCount = 0;
-  ButtonFlag = false;
 }
- 
 /*
  * loop
  * System Loop
  */
-void loop(void){
-  server.handleClient();           // Listen for HTTP request
-  // if (ButtonFlag) getButton();// Handle the button press 
-  if(!client.connected()){
-    reconnect();
+void loop(void) {
+  if(wifiCon){
+    server.handleClient();  // Listen for HTTP request
   }
-  else {
-    if(ButtonFlag) {
-      getButton();
-    }
+  if (ButtonFlag || buttonPressed) {
+    controlButton();
   }
-  client.loop();
-} 
-
+}
